@@ -34,6 +34,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/go-logr/glogr"
@@ -60,6 +61,8 @@ var flRoot = flag.String("root", envString("GIT_SYNC_ROOT", envString("HOME", ""
 	"the root directory for git-sync operations, under which --dest will be created")
 var flDest = flag.String("dest", envString("GIT_SYNC_DEST", ""),
 	"the name of (a symlink to) a directory in which to check-out files under --root (defaults to the leaf dir of --repo)")
+var flErrorFile = flag.String("error-file", envString("GIT_SYNC_ERROR_FILE", ""),
+	"the path to the error file where to dump the most recent error details")
 var flWait = flag.Float64("wait", envFloat("GIT_SYNC_WAIT", 1),
 	"the number of seconds between syncs")
 var flSyncTimeout = flag.Int("timeout", envInt("GIT_SYNC_TIMEOUT", 120),
@@ -218,13 +221,21 @@ func setFlagDefaults() {
 	// Force logging to stderr (from glog).
 	stderrFlag := flag.Lookup("logtostderr")
 	if stderrFlag == nil {
-		fmt.Fprintf(os.Stderr, "ERROR: can't find flag 'logtostderr'\n")
-		os.Exit(1)
+		handleError(1, false, "ERROR: can't find flag 'logtostderr'\n")
 	}
 	stderrFlag.Value.Set("true")
 }
 
 func main() {
+	if *flVer {
+		fmt.Println(version.VERSION)
+		os.Exit(0)
+	}
+
+	if *flErrorFile != "" {
+		validateErrorPath(*flErrorFile)
+	}
+
 	// In case we come up as pid 1, act as init.
 	if os.Getpid() == 1 {
 		fmt.Fprintf(os.Stderr, "INFO: detected pid 1, running init handler\n")
@@ -235,42 +246,28 @@ func main() {
 		if exerr, ok := err.(*exec.ExitError); ok {
 			os.Exit(exerr.ExitCode())
 		}
-		fmt.Fprintf(os.Stderr, "ERROR: unhandled pid1 error: %v\n", err)
-		os.Exit(127)
+		handleError(127, false, "ERROR: unhandled pid1 error: %v\n", err)
 	}
 
 	setFlagDefaults()
 	flag.Parse()
 
-	if *flVer {
-		fmt.Println(version.VERSION)
-		os.Exit(0)
-	}
-
 	if *flRepo == "" {
-		fmt.Fprintf(os.Stderr, "ERROR: --repo must be specified\n")
-		flag.Usage()
-		os.Exit(1)
+		handleError(1, true, "ERROR: --repo must be specified\n")
 	}
 
 	if *flDepth < 0 { // 0 means "no limit"
-		fmt.Fprintf(os.Stderr, "ERROR: --depth must be greater than or equal to 0\n")
-		flag.Usage()
-		os.Exit(1)
+		handleError(1, true, "ERROR: --depth must be greater than or equal to 0\n")
 	}
 
 	switch *flSubmodules {
 	case submodulesRecursive, submodulesShallow, submodulesOff:
 	default:
-		fmt.Fprintf(os.Stderr, "ERROR: --submodules must be one of %q, %q, or %q", submodulesRecursive, submodulesShallow, submodulesOff)
-		flag.Usage()
-		os.Exit(1)
+		handleError(1, true, "ERROR: --submodules must be one of %q, %q, or %q", submodulesRecursive, submodulesShallow, submodulesOff)
 	}
 
 	if *flRoot == "" {
-		fmt.Fprintf(os.Stderr, "ERROR: --root must be specified\n")
-		flag.Usage()
-		os.Exit(1)
+		handleError(1, true,"ERROR: --root must be specified\n")
 	}
 
 	if *flDest == "" {
@@ -279,81 +276,59 @@ func main() {
 	}
 
 	if strings.Contains(*flDest, "/") {
-		fmt.Fprintf(os.Stderr, "ERROR: --dest must be a leaf name, not a path\n")
-		flag.Usage()
-		os.Exit(1)
+		handleError(1, true, "ERROR: --dest must be a leaf name, not a path\n")
 	}
 
 	if *flWait < 0 {
-		fmt.Fprintf(os.Stderr, "ERROR: --wait must be greater than or equal to 0\n")
-		flag.Usage()
-		os.Exit(1)
+		handleError(1, true, "ERROR: --wait must be greater than or equal to 0\n")
 	}
 
 	if *flSyncTimeout < 0 {
-		fmt.Fprintf(os.Stderr, "ERROR: --timeout must be greater than 0\n")
-		flag.Usage()
-		os.Exit(1)
+		handleError(1, true, "ERROR: --timeout must be greater than 0\n")
 	}
 
 	if *flWebhookURL != "" {
 		if *flWebhookStatusSuccess < -1 {
-			fmt.Fprintf(os.Stderr, "ERROR: --webhook-success-status must be a valid HTTP code or -1\n")
-			flag.Usage()
-			os.Exit(1)
+			handleError(1, true, "ERROR: --webhook-success-status must be a valid HTTP code or -1\n")
 		}
 		if *flWebhookTimeout < time.Second {
-			fmt.Fprintf(os.Stderr, "ERROR: --webhook-timeout must be at least 1s\n")
-			flag.Usage()
-			os.Exit(1)
+			handleError(1, true, "ERROR: --webhook-timeout must be at least 1s\n")
 		}
 		if *flWebhookBackoff < time.Second {
-			fmt.Fprintf(os.Stderr, "ERROR: --webhook-backoff must be at least 1s\n")
-			flag.Usage()
-			os.Exit(1)
+			handleError(1, true, "ERROR: --webhook-backoff must be at least 1s\n")
 		}
 	}
 
 	if _, err := exec.LookPath(*flGitCmd); err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: git executable %q not found: %v\n", *flGitCmd, err)
-		os.Exit(1)
+		handleError(1, false, "ERROR: git executable %q not found: %v\n", *flGitCmd, err)
 	}
 
 	if *flSSH {
 		if *flUsername != "" {
-			fmt.Fprintf(os.Stderr, "ERROR: only one of --ssh and --username may be specified\n")
-			os.Exit(1)
+			handleError(1, false, "ERROR: only one of --ssh and --username may be specified\n")
 		}
 		if *flPassword != "" {
-			fmt.Fprintf(os.Stderr, "ERROR: only one of --ssh and --password may be specified\n")
-			os.Exit(1)
+			handleError(1, false, "ERROR: only one of --ssh and --password may be specified\n")
 		}
 		if *flAskPassURL != "" {
-			fmt.Fprintf(os.Stderr, "ERROR: only one of --ssh and --askpass-url may be specified\n")
-			os.Exit(1)
+			handleError(1, false, "ERROR: only one of --ssh and --askpass-url may be specified\n")
 		}
 		if *flCookieFile {
-			fmt.Fprintf(os.Stderr, "ERROR: only one of --ssh and --cookie-file may be specified\n")
-			os.Exit(1)
+			handleError(1, false, "ERROR: only one of --ssh and --cookie-file may be specified\n")
 		}
 		if *flSSHKeyFile == "" {
-			fmt.Fprintf(os.Stderr, "ERROR: --ssh-key-file must be specified when --ssh is specified\n")
-			flag.Usage()
-			os.Exit(1)
+			handleError(1, true, "ERROR: --ssh-key-file must be specified when --ssh is specified\n")
 		}
 		if *flSSHKnownHosts {
 			if *flSSHKnownHostsFile == "" {
-				fmt.Fprintf(os.Stderr, "ERROR: --ssh-known-hosts-file must be specified when --ssh-known-hosts is specified\n")
-				flag.Usage()
-				os.Exit(1)
+				handleError(1, true, "ERROR: --ssh-known-hosts-file must be specified when --ssh-known-hosts is specified\n")
 			}
 		}
 	}
 
 	if *flAddUser {
 		if err := addUser(); err != nil {
-			fmt.Fprintf(os.Stderr, "ERROR: can't write to /etc/passwd: %v\n", err)
-			os.Exit(1)
+			handleError(1, false, "ERROR: can't write to /etc/passwd: %v\n", err)
 		}
 	}
 
@@ -363,30 +338,26 @@ func main() {
 
 	if *flUsername != "" && *flPassword != "" {
 		if err := setupGitAuth(ctx, *flUsername, *flPassword, *flRepo); err != nil {
-			fmt.Fprintf(os.Stderr, "ERROR: can't create .netrc file: %v\n", err)
-			os.Exit(1)
+			handleError(1, false, "ERROR: can't create .netrc file: %v\n", err)
 		}
 	}
 
 	if *flSSH {
 		if err := setupGitSSH(*flSSHKnownHosts); err != nil {
-			fmt.Fprintf(os.Stderr, "ERROR: can't configure SSH: %v\n", err)
-			os.Exit(1)
+			handleError(1, false, "ERROR: can't configure SSH: %v\n", err)
 		}
 	}
 
 	if *flCookieFile {
 		if err := setupGitCookieFile(ctx); err != nil {
-			fmt.Fprintf(os.Stderr, "ERROR: can't set git cookie file: %v\n", err)
-			os.Exit(1)
+			handleError(1, false, "ERROR: can't set git cookie file: %v\n", err)
 		}
 	}
 
 	if *flAskPassURL != "" {
 		if err := callGitAskPassURL(ctx, *flAskPassURL); err != nil {
 			askpassCount.WithLabelValues(metricKeyError).Inc()
-			fmt.Fprintf(os.Stderr, "ERROR: failed to call ASKPASS callback URL: %v\n", err)
-			os.Exit(1)
+			handleError(1, false, "ERROR: failed to call ASKPASS callback URL: %v\n", err)
 		}
 		askpassCount.WithLabelValues(metricKeySuccess).Inc()
 	}
@@ -397,8 +368,7 @@ func main() {
 	if *flHTTPBind != "" {
 		ln, err := net.Listen("tcp", *flHTTPBind)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "ERROR: unable to bind HTTP endpoint: %v\n", err)
-			os.Exit(1)
+			handleError(1, false, "ERROR: unable to bind HTTP endpoint: %v\n", err)
 		}
 		mux := http.NewServeMux()
 		go func() {
@@ -453,11 +423,13 @@ func main() {
 			if *flMaxSyncFailures != -1 && failCount >= *flMaxSyncFailures {
 				// Exit after too many retries, maybe the error is not recoverable.
 				log.Error(err, "too many failures, aborting", "failCount", failCount)
+				exportError(err.Error())
 				os.Exit(1)
 			}
 
 			failCount++
 			log.Error(err, "unexpected error syncing repo, will retry")
+			exportError(err.Error())
 			log.V(0).Info("waiting before retrying", "waitTime", waitTime(*flWait))
 			cancel()
 			time.Sleep(waitTime(*flWait))
@@ -473,19 +445,23 @@ func main() {
 
 		if initialSync {
 			if *flOneTime {
+				deleteErrorFile()
 				os.Exit(0)
 			}
 			if isHash, err := revIsHash(ctx, *flRev, *flRoot); err != nil {
 				log.Error(err, "can't tell if rev is a git hash, exiting", "rev", *flRev)
+				exportError(err.Error())
 				os.Exit(1)
 			} else if isHash {
 				log.V(0).Info("rev appears to be a git hash, no further sync needed", "rev", *flRev)
+				deleteErrorFile()
 				sleepForever()
 			}
 			initialSync = false
 		}
 
 		failCount = 0
+		deleteErrorFile()
 		log.V(1).Info("next sync", "wait_time", waitTime(*flWait))
 		cancel()
 		time.Sleep(waitTime(*flWait))
@@ -508,6 +484,72 @@ func sleepForever() {
 	signal.Notify(c, os.Interrupt, os.Kill)
 	<-c
 	os.Exit(0)
+}
+
+// validateErrorPath validates if the parent directory of `--error-file` exits and creates one if not exits.
+// It also checks if the parent directory has the read and write permission.
+func validateErrorPath(errPath string) {
+	errDir := filepath.Dir(errPath)
+	if errDirInfo, err := os.Stat(errDir); err != nil {
+		fmt.Printf("The error parent path %s doesn't exist. Attempt to create it\n", errDir)
+		if err = os.MkdirAll(errDir, 0755); err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: can't create directory: %v\n", err)
+			os.Exit(1)
+		}
+	} else if !errDirInfo.IsDir() {
+		fmt.Fprintf(os.Stderr, "ERROR: The error parent path %s is not a directory\n", errDir)
+		os.Exit(1)
+	} else if err = syscall.Access(errDir, syscall.O_RDWR); err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: can't access %s: %v\n", errDir, err)
+		os.Exit(1)
+	}
+}
+
+// exportError writes the error content to the error file.
+func exportError(content string) {
+	if *flErrorFile != "" {
+		file, err := os.Create(*flErrorFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: can't create error file: %v\n", err)
+			os.Exit(1)
+		}
+		defer func() {
+			if err := file.Close(); err != nil {
+				fmt.Fprintf(os.Stderr, "ERROR: can't close error file: %v\n", err)
+			}
+		}()
+
+		if _, err := file.WriteString(content); err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: can't write to error file: %v\n", err)
+			os.Exit(1)
+		}
+	}
+}
+
+// deleteErrorFile deletes the error file.
+func deleteErrorFile() {
+	if _, err := os.Stat(*flErrorFile); err != nil {
+		if os.IsNotExist(err) {
+			return
+		} else {
+			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+		}
+	}
+
+	if err := os.Remove(*flErrorFile); err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: can't delete the error file: %v\n", err)
+	}
+}
+
+// handleError prints the error to the standard error, prints the usage if the `printUsage` flag is true,
+// exports the error to the error file and exits the process with the exit code.
+func handleError(exitCode int, printUsage bool, format string, a ...interface{}) {
+	fmt.Fprintf(os.Stderr, format, a...)
+	if printUsage {
+		flag.Usage()
+	}
+	exportError(fmt.Sprintf(format, a...))
+	os.Exit(exitCode)
 }
 
 // Put the current UID/GID into /etc/passwd so SSH can look it up.  This
