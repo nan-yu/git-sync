@@ -269,12 +269,14 @@ HTTP_PORT=9376
 METRIC_GOOD_SYNC_COUNT='git_sync_count_total{status="success"}'
 METRIC_FETCH_COUNT='git_fetch_count_total'
 
+TEST_GITHUB_APP_PRIVATE_KEY_FILE="github_app_private_key.pem"
 function GIT_SYNC() {
     #./bin/linux_amd64/git-sync "$@"
     RM="--rm"
     if [[ "${CLEANUP:-}" == 0 ]]; then
         RM=""
     fi
+    echo "$TEST_GITHUB_APP_PRIVATE_KEY" > "$(pwd)/$TEST_GITHUB_APP_PRIVATE_KEY_FILE"
     docker run \
         -i \
         ${RM} \
@@ -291,6 +293,7 @@ function GIT_SYNC() {
         -v "$DOT_SSH/1/id_test":"/ssh/secret.1":ro \
         -v "$DOT_SSH/2/id_test":"/ssh/secret.2":ro \
         -v "$DOT_SSH/3/id_test":"/ssh/secret.3":ro \
+        -v "$(pwd)/$TEST_GITHUB_APP_PRIVATE_KEY_FILE":"/$TEST_GITHUB_APP_PRIVATE_KEY_FILE":ro \
         "${IMAGE}" \
             -v=6 \
             --add-user \
@@ -2178,6 +2181,33 @@ function e2e::auth_askpass_url_slow_start() {
     assert_link_exists "$ROOT/link"
     assert_file_exists "$ROOT/link/file"
     assert_file_eq "$ROOT/link/file" "${FUNCNAME[0]}"
+}
+
+##############################################
+# Test github app auth
+##############################################
+function e2e::auth_github_app_application_id() {
+    GIT_SYNC \
+        --one-time \
+        --repo="$TEST_GITHUB_APP_AUTH_TEST_REPO" \
+        --github-app-application-id "$TEST_GITHUB_APP_APPLICATION_ID" \
+        --github-app-installation-id "$TEST_GITHUB_APP_INSTALLATION_ID" \
+        --github-app-private-key-file "/$TEST_GITHUB_APP_PRIVATE_KEY_FILE" \
+        --root="$ROOT" \
+        --link="link"
+    assert_file_exists "$ROOT/link/LICENSE"
+}
+
+function e2e::auth_github_app_client_id() {
+    GIT_SYNC \
+        --one-time \
+        --repo="$TEST_GITHUB_APP_AUTH_TEST_REPO" \
+        --github-app-client-id "$TEST_GITHUB_APP_CLIENT_ID" \
+        --github-app-installation-id "$TEST_GITHUB_APP_INSTALLATION_ID" \
+        --github-app-private-key-file "/$TEST_GITHUB_APP_PRIVATE_KEY_FILE" \
+        --root="$ROOT" \
+        --link="link"
+    assert_file_exists "$ROOT/link/LICENSE"
 }
 
 ##############################################
